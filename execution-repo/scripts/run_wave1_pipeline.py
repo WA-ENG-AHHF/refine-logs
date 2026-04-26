@@ -43,6 +43,11 @@ def parse_args() -> argparse.Namespace:
         help="Skip the S2 PCR-NO stage entirely.",
     )
     parser.add_argument(
+        "--s2-dry-run",
+        action="store_true",
+        help="Run S2 in dry-run mode instead of minimal real training.",
+    )
+    parser.add_argument(
         "--strict-metrics",
         action="store_true",
         help="Pass --strict to plot_metrics.py.",
@@ -111,7 +116,7 @@ def main() -> int:
         "--run-name",
         s2_run_name,
     ]
-    if not args.skip_s2:
+    if args.s2_dry_run:
         s2_command.append("--dry-run")
 
     metrics_summary = REPO_ROOT / "results" / "MASTER_METRICS.csv"
