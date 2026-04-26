@@ -1,0 +1,11 @@
+stage: S3
+runs:
+  - S3.1
+  - S3.2
+  - S3.3
+  - S3.4
+  - S3.5
+controls:
+  same_param_baseline: true
+output:
+  metrics_csv: results/S3_ablation_matrix.csv

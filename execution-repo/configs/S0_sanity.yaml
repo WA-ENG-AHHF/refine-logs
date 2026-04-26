@@ -1,0 +1,12 @@
+stage: S0
+dataset:
+  name: ADR
+  grid_size: 64
+  num_samples: 100
+checks:
+  validate_shapes: true
+  validate_boundary_encoding: true
+  validate_gradients: true
+  validate_checkpoint_cycle: true
+output:
+  report_json: logs/S0_sanity_report.json

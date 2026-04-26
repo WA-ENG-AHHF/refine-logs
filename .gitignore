@@ -1,0 +1,9 @@
+.DS_Store
+Thumbs.db
+*.tmp
+*.log
+execution-repo/logs/
+execution-repo/results/
+execution-repo/checkpoints/
+execution-repo/figures/
+execution-repo/data/

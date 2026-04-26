@@ -1,0 +1,14 @@
+stage: S1
+model:
+  name: FNO-residual
+train:
+  epochs: 100
+  batch_size: 32
+  learning_rate: 0.001
+loss:
+  l2: 0.7
+  pde: 0.2
+  bc: 0.1
+output:
+  checkpoint: checkpoints/S1_baseline_best.pt
+  metrics_csv: results/S1_metrics.csv

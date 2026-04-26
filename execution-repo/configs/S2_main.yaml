@@ -1,0 +1,17 @@
+stage: S2
+model:
+  name: PCR-NO
+  proj_dim: 64
+  eq_wise_heads: true
+train:
+  epochs: 120
+  batch_size: 32
+  learning_rate: 0.001
+loss:
+  l2: 0.6
+  pde: 0.2
+  bc: 0.1
+  conservation: 0.1
+output:
+  checkpoint: checkpoints/S2_best.pt
+  metrics_csv: results/S2_metric_comparison.csv

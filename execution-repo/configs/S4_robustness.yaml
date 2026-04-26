@@ -1,0 +1,8 @@
+stage: S4
+eval:
+  ood_coupling: true
+  long_rollout: true
+  divergence_threshold: 0.5
+output:
+  ood_csv: results/S4_ood_analysis.csv
+  rollout_csv: results/S4_rollout_metrics.csv
