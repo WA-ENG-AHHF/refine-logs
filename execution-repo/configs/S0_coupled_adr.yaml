@@ -1,0 +1,16 @@
+stage: S0
+dataset:
+  name: coupled-adr-v1
+  grid_size: 64
+  num_samples: 384
+  root_dir: data/coupled_adr_v1
+  manifest_path: data/coupled_adr_v1/manifest.json
+  required_paths:
+    - data/coupled_adr_v1/manifest.json
+checks:
+  validate_shapes: true
+  validate_boundary_encoding: true
+  validate_gradients: true
+  validate_checkpoint_cycle: true
+output:
+  report_json: logs/S0_coupled_adr_report.json

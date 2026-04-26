@@ -1,0 +1,33 @@
+dataset:
+  name: coupled-adr-v1
+  version: 2026-04-26
+  output_dir: data/coupled_adr_v1
+  train_samples: 256
+  val_samples: 64
+  test_samples: 64
+  seed: 42
+grid:
+  coarse_size: 16
+  fine_size: 64
+time:
+  total_time: 0.12
+  base_num_steps: 60
+physics:
+  coupling_min: 0.05
+  coupling_max: 0.35
+  diffusion_u_min: 0.008
+  diffusion_u_max: 0.02
+  diffusion_v_min: 0.01
+  diffusion_v_max: 0.025
+  advection_u_min: -0.2
+  advection_u_max: 0.2
+  advection_v_min: -0.15
+  advection_v_max: 0.15
+  reaction_u_min: -0.08
+  reaction_u_max: 0.03
+  reaction_v_min: -0.08
+  reaction_v_max: 0.03
+  source_amplitude_min: 0.15
+  source_amplitude_max: 0.6
+  source_width_min: 0.05
+  source_width_max: 0.18

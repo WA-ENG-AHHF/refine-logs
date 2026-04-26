@@ -23,6 +23,21 @@ def parse_args() -> argparse.Namespace:
         help="Prefix used to name stage-specific scaffold runs.",
     )
     parser.add_argument(
+        "--s0-config",
+        default=str(REPO_ROOT / "configs" / "S0_sanity.yaml"),
+        help="Path to the S0 config.",
+    )
+    parser.add_argument(
+        "--s1-config",
+        default=str(REPO_ROOT / "configs" / "S1_baseline.yaml"),
+        help="Path to the S1 config.",
+    )
+    parser.add_argument(
+        "--s2-config",
+        default=str(REPO_ROOT / "configs" / "S2_main.yaml"),
+        help="Path to the S2 config.",
+    )
+    parser.add_argument(
         "--skip-s2",
         action="store_true",
         help="Skip the S2 PCR-NO stage entirely.",
@@ -76,14 +91,14 @@ def main() -> int:
         python_executable,
         str(SCRIPTS_DIR / "run_sanity_check.py"),
         "--config",
-        str(REPO_ROOT / "configs" / "S0_sanity.yaml"),
+        str(Path(args.s0_config).resolve()),
     ]
     s1_run_name = f"{args.run_prefix}_s1"
     s1_command = [
         python_executable,
         str(SCRIPTS_DIR / "train_baseline.py"),
         "--config",
-        str(REPO_ROOT / "configs" / "S1_baseline.yaml"),
+        str(Path(args.s1_config).resolve()),
         "--run-name",
         s1_run_name,
     ]
@@ -92,7 +107,7 @@ def main() -> int:
         python_executable,
         str(SCRIPTS_DIR / "train_pcr_no.py"),
         "--config",
-        str(REPO_ROOT / "configs" / "S2_main.yaml"),
+        str(Path(args.s2_config).resolve()),
         "--run-name",
         s2_run_name,
     ]

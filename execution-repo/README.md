@@ -88,3 +88,30 @@ python scripts/prepare_sample_dataset.py
 ```
 
 This writes a small manifest-based dataset under `data/sample_adr/`, which is ignored by Git but usable by `S0` and `S1` for local validation.
+
+## Formal coupled PDE dataset pipeline
+
+Generate the first research-oriented coupled ADR dataset with:
+
+```bash
+python scripts/prepare_coupled_pde_dataset.py --config configs/DATASET_coupled_adr.yaml
+```
+
+Then validate and run the scaffold pipeline against the generated data:
+
+```bash
+python scripts/run_sanity_check.py --config configs/S0_coupled_adr.yaml
+python scripts/run_wave1_pipeline.py ^
+  --run-prefix coupled_adr ^
+  --s0-config configs/S0_coupled_adr.yaml ^
+  --s1-config configs/S1_baseline_coupled_adr.yaml ^
+  --s2-config configs/S2_main_coupled_adr.yaml
+```
+
+The generated formal dataset uses:
+- coarse grid size `16`
+- fine grid size `64`
+- two coupled fields `u` and `v`
+- six input channels: interpolated coarse fields, two source channels, coordinate, coupling
+- two target channels: fine `u` and fine `v`
+- residual targets saved alongside direct fine-state targets
