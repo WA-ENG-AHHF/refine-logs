@@ -266,12 +266,14 @@ def resolve_output_plan(
 
     stage = str(config.get("stage", "S2"))
     output_cfg = config.get("output", {})
+    root_dir = REPO_ROOT / str(output_cfg.get("root_dir", f"outputs/{stage}"))
+    run_dir = root_dir / run_name
     checkpoint = REPO_ROOT / str(output_cfg.get("checkpoint", f"checkpoints/{stage}_best.pt"))
     metrics_csv = REPO_ROOT / str(
         output_cfg.get("metrics_csv", f"results/{stage}_metric_comparison.csv")
     )
-    log_file = REPO_ROOT / "logs" / run_name / "train.log"
-    summary_json = REPO_ROOT / "reports" / f"{run_name}_summary.json"
+    log_file = run_dir / "logs" / "train.log"
+    summary_json = run_dir / "reports" / "run_summary.json"
     return {
         "checkpoint": checkpoint,
         "metrics_csv": metrics_csv,
