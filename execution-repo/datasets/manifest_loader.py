@@ -128,3 +128,18 @@ def inspect_dataset_manifest(manifest_path: Path) -> DatasetInspection:
         contains_inf=contains_inf,
         files=files,
     )
+
+
+def load_split_arrays(manifest_path: Path, split_name: str) -> dict[str, np.ndarray]:
+    manifest = load_dataset_manifest(manifest_path)
+    splits = manifest.get("splits", {})
+    if split_name not in splits:
+        raise KeyError(f"Split `{split_name}` not found in {manifest_path}")
+
+    merged: dict[str, list[np.ndarray]] = {}
+    for file_path in _resolve_split_files(manifest_path, splits[split_name]):
+        with np.load(file_path) as payload:
+            for key in payload.files:
+                merged.setdefault(key, []).append(np.asarray(payload[key]))
+
+    return {key: np.concatenate(value, axis=0) for key, value in merged.items()}

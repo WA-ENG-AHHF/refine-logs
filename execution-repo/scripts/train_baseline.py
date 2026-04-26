@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 try:
     import yaml
 
@@ -23,7 +25,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from models.fno_baseline import FNOBaselineStub, TORCH_AVAILABLE
-from datasets import inspect_dataset_manifest
+from datasets import inspect_dataset_manifest, load_split_arrays
 
 
 @dataclass
@@ -205,7 +207,54 @@ def count_parameters(model: Any) -> int:
     return 0
 
 
-def write_metrics_placeholder(metrics_path: Path) -> None:
+def rel_l2(predictions: np.ndarray, targets: np.ndarray) -> float:
+    numerator = float(np.linalg.norm(predictions - targets))
+    denominator = float(np.linalg.norm(targets))
+    return numerator / max(denominator, 1e-8)
+
+
+def load_training_data(config: dict[str, Any]) -> dict[str, dict[str, np.ndarray]]:
+    dataset_cfg = config.get("dataset", {})
+    manifest_path = Path(str(dataset_cfg.get("manifest_path", "")))
+    if not manifest_path.is_absolute():
+        manifest_path = (REPO_ROOT / manifest_path).resolve()
+    return {
+        "train": load_split_arrays(manifest_path, "train"),
+        "val": load_split_arrays(manifest_path, "val"),
+    }
+
+
+def flatten_supervised_arrays(split_payload: dict[str, np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
+    inputs = np.asarray(split_payload["inputs"], dtype=np.float64)
+    targets = np.asarray(split_payload["targets"], dtype=np.float64)
+    return inputs.reshape(-1, inputs.shape[-1]), targets.reshape(-1, targets.shape[-1])
+
+
+def fit_numpy_linear_baseline(
+    train_payload: dict[str, np.ndarray], val_payload: dict[str, np.ndarray]
+) -> dict[str, Any]:
+    train_x, train_y = flatten_supervised_arrays(train_payload)
+    val_x, val_y = flatten_supervised_arrays(val_payload)
+
+    train_aug = np.concatenate([train_x, np.ones((train_x.shape[0], 1))], axis=1)
+    val_aug = np.concatenate([val_x, np.ones((val_x.shape[0], 1))], axis=1)
+    ridge = 1e-6
+    gram = train_aug.T @ train_aug + ridge * np.eye(train_aug.shape[1])
+    weights = np.linalg.solve(gram, train_aug.T @ train_y)
+
+    train_pred = train_aug @ weights
+    val_pred = val_aug @ weights
+    return {
+        "backend": "numpy-linear",
+        "train_rel_l2": rel_l2(train_pred, train_y),
+        "val_rel_l2": rel_l2(val_pred, val_y),
+        "weights": weights.astype(np.float32).tolist(),
+        "train_samples": int(train_payload["inputs"].shape[0]),
+        "val_samples": int(val_payload["inputs"].shape[0]),
+    }
+
+
+def write_metrics_rows(metrics_path: Path, rows: list[dict[str, Any]]) -> None:
     with metrics_path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(
             handle,
@@ -223,20 +272,8 @@ def write_metrics_placeholder(metrics_path: Path) -> None:
             ],
         )
         writer.writeheader()
-        writer.writerow(
-            {
-                "run_id": "",
-                "stage": "S1",
-                "epoch": 0,
-                "split": "init",
-                "tag": "scaffold",
-                "rel_l2": "",
-                "pde_residual": "",
-                "bc_violation": "",
-                "conservation_error": "",
-                "status": "scaffold_initialized",
-            }
-        )
+        for row in rows:
+            writer.writerow(row)
 
 
 def save_checkpoint_metadata(
@@ -245,6 +282,7 @@ def save_checkpoint_metadata(
     model: Any,
     started_at: datetime,
     finished_at: datetime,
+    training_state: dict[str, Any],
 ) -> None:
     checkpoint_payload = {
         "kind": "baseline_scaffold_checkpoint",
@@ -254,12 +292,7 @@ def save_checkpoint_metadata(
         "started_at_utc": started_at.isoformat(),
         "parameter_count": count_parameters(model),
         "state_dict": model.state_dict(),
-        "training_state": {
-            "epoch": 0,
-            "global_step": 0,
-            "status": "not_trained",
-            "notes": "Placeholder checkpoint metadata created by scaffold.",
-        },
+        "training_state": training_state,
     }
     if TORCH_AVAILABLE:
         import torch
@@ -298,9 +331,10 @@ def write_summary(
     model: Any,
     started_at: datetime,
     finished_at: datetime,
+    training_results: dict[str, Any],
 ) -> None:
     summary = {
-        "status": "initialized",
+        "status": "trained_minimal_baseline",
         "stage": config.get("stage", "S1"),
         "run_name": run_name,
         "config_path": str(config_path),
@@ -315,11 +349,11 @@ def write_summary(
         "train": config.get("train", {}),
         "loss": config.get("loss", {}),
         "dataset": inspect_configured_dataset(config),
+        "training_results": training_results,
         "artifacts": {key: str(value) for key, value in asdict(artifacts).items()},
         "notes": [
-            "This is a runnable baseline scaffold.",
-            "Dataset manifest loading is wired in for real-file validation.",
-            "The real optimization loop is still intentionally minimal.",
+            "This run consumed manifest-backed dataset files.",
+            "The baseline uses a minimal training path for environment portability.",
         ],
     }
     with summary_path.open("w", encoding="utf-8") as handle:
@@ -335,12 +369,56 @@ def main() -> None:
     run_name = build_run_name(config, args.run_name, started_at)
     artifacts = prepare_artifacts(config, run_name)
     model = build_model(config)
+    split_payloads = load_training_data(config)
+    training_results = fit_numpy_linear_baseline(split_payloads["train"], split_payloads["val"])
 
-    write_metrics_placeholder(artifacts.metrics_path)
+    write_metrics_rows(
+        artifacts.metrics_path,
+        [
+            {
+                "run_id": run_name,
+                "stage": "S1",
+                "epoch": 1,
+                "split": "train",
+                "tag": training_results["backend"],
+                "rel_l2": training_results["train_rel_l2"],
+                "pde_residual": "",
+                "bc_violation": "",
+                "conservation_error": "",
+                "status": "trained",
+            },
+            {
+                "run_id": run_name,
+                "stage": "S1",
+                "epoch": 1,
+                "split": "val",
+                "tag": training_results["backend"],
+                "rel_l2": training_results["val_rel_l2"],
+                "pde_residual": "",
+                "bc_violation": "",
+                "conservation_error": "",
+                "status": "evaluated",
+            },
+        ],
+    )
     write_resolved_config(config, artifacts, run_name)
 
     finished_at = utc_now()
-    save_checkpoint_metadata(artifacts.checkpoint_path, config, model, started_at, finished_at)
+    save_checkpoint_metadata(
+        artifacts.checkpoint_path,
+        config,
+        model,
+        started_at,
+        finished_at,
+        training_state={
+            "epoch": 1,
+            "global_step": int(split_payloads["train"]["inputs"].shape[0]),
+            "status": "trained_minimal_baseline",
+            "backend": training_results["backend"],
+            "train_rel_l2": training_results["train_rel_l2"],
+            "val_rel_l2": training_results["val_rel_l2"],
+        },
+    )
     write_summary(
         summary_path=artifacts.summary_path,
         config_path=config_path,
@@ -350,13 +428,16 @@ def main() -> None:
         model=model,
         started_at=started_at,
         finished_at=finished_at,
+        training_results=training_results,
     )
 
-    print(f"Initialized baseline scaffold run: {run_name}")
+    print(f"Initialized baseline run: {run_name}")
     print(f"Run directory: {artifacts.run_dir}")
     print(f"Summary: {artifacts.summary_path}")
     print(f"Checkpoint metadata: {artifacts.checkpoint_path}")
-    print(f"Metrics placeholder: {artifacts.metrics_path}")
+    print(f"Metrics: {artifacts.metrics_path}")
+    print(f"Train rel-L2: {training_results['train_rel_l2']:.6f}")
+    print(f"Val rel-L2: {training_results['val_rel_l2']:.6f}")
 
 
 if __name__ == "__main__":
