@@ -192,13 +192,33 @@ def count_parameters(model: Any) -> int:
 
 def write_metrics_placeholder(metrics_path: Path) -> None:
     with metrics_path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=["epoch", "train_loss", "val_loss", "status"])
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "run_id",
+                "stage",
+                "epoch",
+                "split",
+                "tag",
+                "rel_l2",
+                "pde_residual",
+                "bc_violation",
+                "conservation_error",
+                "status",
+            ],
+        )
         writer.writeheader()
         writer.writerow(
             {
+                "run_id": "",
+                "stage": "S1",
                 "epoch": 0,
-                "train_loss": "",
-                "val_loss": "",
+                "split": "init",
+                "tag": "scaffold",
+                "rel_l2": "",
+                "pde_residual": "",
+                "bc_violation": "",
+                "conservation_error": "",
                 "status": "scaffold_initialized",
             }
         )

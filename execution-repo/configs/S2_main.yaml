@@ -1,8 +1,15 @@
 stage: S2
 model:
   name: PCR-NO
+  hidden_dim: 128
   proj_dim: 64
+  num_heads: 4
   eq_wise_heads: true
+  dropout: 0.0
+data:
+  input_dim: 4
+  output_dim: 1
+  sequence_length: 64
 train:
   epochs: 120
   batch_size: 32

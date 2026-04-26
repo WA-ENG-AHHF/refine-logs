@@ -52,6 +52,7 @@ Prefer separate modules over shared edits when two agents are active at the same
 ```bash
 pip install -r requirements.txt
 python scripts/run_sanity_check.py
+python scripts/run_wave1_pipeline.py --run-prefix smoke
 ```
 
 ## Expected evolution
@@ -62,3 +63,17 @@ This scaffold should gradually grow into:
 - PCR projection layer
 - equation-wise residual heads
 - shared metrics and plotting utilities
+
+## Smoke pipeline
+
+Use the integration runner to exercise the current scaffold end to end:
+
+```bash
+python scripts/run_wave1_pipeline.py --run-prefix smoke
+```
+
+This currently runs:
+- `S0` sanity validation
+- `S1` baseline scaffold initialization
+- `S2` PCR-NO dry-run validation
+- metrics aggregation into `results/MASTER_METRICS.csv`

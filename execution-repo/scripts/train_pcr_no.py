@@ -252,13 +252,25 @@ def run_training_step(
 def append_metrics_row(metrics_csv: Path, row: dict[str, Any]) -> None:
     """Append a metrics row, creating the CSV header when needed."""
 
-    fieldnames = list(row.keys())
+    fieldnames = [
+        "run_id",
+        "stage",
+        "epoch",
+        "split",
+        "tag",
+        "rel_l2",
+        "pde_residual",
+        "bc_violation",
+        "conservation_error",
+        "total",
+        "status",
+    ]
     write_header = not metrics_csv.exists()
     with metrics_csv.open("a", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         if write_header:
             writer.writeheader()
-        writer.writerow(row)
+        writer.writerow({name: row.get(name, "") for name in fieldnames})
 
 
 def save_summary(summary_json: Path, payload: dict[str, Any]) -> None:
@@ -352,7 +364,19 @@ def main() -> None:
     summary["final_metrics"] = metrics
     append_metrics_row(
         output_plan["metrics_csv"],
-        {"run_name": run_name, "stage": stage, **metrics},
+        {
+            "run_id": run_name,
+            "stage": stage,
+            "epoch": 1,
+            "split": "train",
+            "tag": "synthetic_step",
+            "rel_l2": metrics.get("l2", ""),
+            "pde_residual": metrics.get("pde", ""),
+            "bc_violation": metrics.get("bc", ""),
+            "conservation_error": metrics.get("conservation", ""),
+            "total": metrics.get("total", ""),
+            "status": "synthetic_train_step",
+        },
     )
     save_summary(output_plan["summary_json"], summary)
     save_checkpoint(output_plan["checkpoint"], model, metadata=summary)
