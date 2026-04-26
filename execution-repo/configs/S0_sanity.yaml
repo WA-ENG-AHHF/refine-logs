@@ -1,8 +1,12 @@
 stage: S0
 dataset:
-  name: ADR
+  name: ADR-sample
   grid_size: 64
-  num_samples: 100
+  num_samples: 20
+  root_dir: data/sample_adr
+  manifest_path: data/sample_adr/manifest.json
+  required_paths:
+    - data/sample_adr/manifest.json
 checks:
   validate_shapes: true
   validate_boundary_encoding: true

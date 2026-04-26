@@ -23,6 +23,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from models.fno_baseline import FNOBaselineStub, TORCH_AVAILABLE
+from datasets import inspect_dataset_manifest
 
 
 @dataclass
@@ -182,6 +183,20 @@ def build_model(config: dict[str, Any]) -> FNOBaselineStub:
     )
 
 
+def inspect_configured_dataset(config: dict[str, Any]) -> dict[str, Any]:
+    dataset_cfg = config.get("dataset", {})
+    if not isinstance(dataset_cfg, dict):
+        return {"status": "not_configured"}
+
+    manifest_path = dataset_cfg.get("manifest_path")
+    if not manifest_path:
+        return {"status": "not_configured"}
+
+    resolved_manifest = (REPO_ROOT / str(manifest_path)).resolve()
+    inspection = inspect_dataset_manifest(resolved_manifest)
+    return {"status": "loaded", **inspection.to_dict()}
+
+
 def count_parameters(model: Any) -> int:
     if hasattr(model, "parameter_count"):
         return int(model.parameter_count())
@@ -299,10 +314,12 @@ def write_summary(
         },
         "train": config.get("train", {}),
         "loss": config.get("loss", {}),
+        "dataset": inspect_configured_dataset(config),
         "artifacts": {key: str(value) for key, value in asdict(artifacts).items()},
         "notes": [
             "This is a runnable baseline scaffold.",
-            "Dataset hookup and real optimization loop are intentionally not implemented yet.",
+            "Dataset manifest loading is wired in for real-file validation.",
+            "The real optimization loop is still intentionally minimal.",
         ],
     }
     with summary_path.open("w", encoding="utf-8") as handle:

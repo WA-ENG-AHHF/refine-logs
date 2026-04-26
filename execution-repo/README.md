@@ -51,6 +51,7 @@ Prefer separate modules over shared edits when two agents are active at the same
 
 ```bash
 pip install -r requirements.txt
+python scripts/prepare_sample_dataset.py
 python scripts/run_sanity_check.py
 python scripts/run_wave1_pipeline.py --run-prefix smoke
 ```
@@ -77,3 +78,13 @@ This currently runs:
 - `S1` baseline scaffold initialization
 - `S2` PCR-NO dry-run validation
 - metrics aggregation into `results/MASTER_METRICS.csv`
+
+## Sample dataset path
+
+The repo now includes a tiny local-data workflow:
+
+```bash
+python scripts/prepare_sample_dataset.py
+```
+
+This writes a small manifest-based dataset under `data/sample_adr/`, which is ignored by Git but usable by `S0` and `S1` for local validation.

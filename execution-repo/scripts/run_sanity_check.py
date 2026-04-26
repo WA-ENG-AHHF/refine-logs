@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,6 +12,12 @@ try:
     import yaml  # type: ignore
 except ImportError:  # pragma: no cover - optional dependency
     yaml = None
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from datasets import inspect_dataset_manifest
 
 
 REQUIRED_TOP_LEVEL_FIELDS = {
@@ -102,31 +109,45 @@ def _coerce_scalar(raw_value: str) -> Any:
 
 def _basic_yaml_load(text: str) -> dict[str, Any]:
     root: dict[str, Any] = {}
-    stack: list[tuple[int, dict[str, Any]]] = [(-1, root)]
+    stack: list[tuple[int, Any]] = [(-1, root)]
 
     for line_number, raw_line in enumerate(text.splitlines(), start=1):
         stripped = raw_line.strip()
         if not stripped or stripped.startswith("#"):
             continue
-        if ":" not in raw_line:
-            raise ValueError(f"Unsupported YAML syntax on line {line_number}: {raw_line}")
-
         indent = len(raw_line) - len(raw_line.lstrip(" "))
         if indent % 2 != 0:
             raise ValueError(
                 f"Expected multiples of two spaces for indentation on line {line_number}."
             )
 
-        key, raw_value = raw_line.strip().split(":", 1)
         while stack and indent <= stack[-1][0]:
             stack.pop()
         if not stack:
             raise ValueError(f"Invalid YAML nesting near line {line_number}.")
 
         current = stack[-1][1]
+        if stripped.startswith("- "):
+            if not isinstance(current, list):
+                raise ValueError(f"List item found outside a list on line {line_number}.")
+            current.append(_coerce_scalar(stripped[2:]))
+            continue
+
+        if ":" not in raw_line:
+            raise ValueError(f"Unsupported YAML syntax on line {line_number}: {raw_line}")
+
+        key, raw_value = raw_line.strip().split(":", 1)
         value = raw_value.strip()
         if value == "":
-            nested: dict[str, Any] = {}
+            next_container: Any = []
+            sibling_lines = text.splitlines()[line_number:]
+            next_meaningful = next(
+                (candidate.strip() for candidate in sibling_lines if candidate.strip() and not candidate.strip().startswith("#")),
+                "",
+            )
+            if not next_meaningful.startswith("- "):
+                next_container = {}
+            nested = next_container
             current[key] = nested
             stack.append((indent, nested))
         else:
@@ -274,6 +295,82 @@ def validate_configured_paths(config: dict[str, Any], repo_root: Path) -> list[C
     return results
 
 
+def validate_dataset_manifest(config: dict[str, Any], repo_root: Path) -> list[CheckResult]:
+    results: list[CheckResult] = []
+    dataset = config.get("dataset", {})
+    if not isinstance(dataset, dict):
+        return results
+
+    manifest_value = dataset.get("manifest_path")
+    if not manifest_value:
+        return results
+
+    manifest_path = resolve_path(manifest_value, repo_root)
+    if not manifest_path.exists():
+        results.append(
+            CheckResult(
+                name="dataset_manifest",
+                status="failed",
+                severity="error",
+                message="Configured dataset manifest does not exist.",
+                details={"path": str(manifest_path)},
+            )
+        )
+        return results
+
+    inspection = inspect_dataset_manifest(manifest_path)
+    expected_samples = dataset.get("num_samples")
+    expected_grid_size = dataset.get("grid_size")
+
+    results.append(
+        CheckResult(
+            name="dataset_manifest",
+            status="passed",
+            severity="info",
+            message="Loaded dataset manifest successfully.",
+            details=inspection.to_dict(),
+        )
+    )
+    results.append(
+        CheckResult(
+            name="dataset_sample_count",
+            status="passed" if expected_samples == inspection.total_samples else "failed",
+            severity="error" if expected_samples != inspection.total_samples else "info",
+            message="Compared configured sample count with manifest inspection.",
+            details={
+                "expected_num_samples": expected_samples,
+                "observed_num_samples": inspection.total_samples,
+            },
+        )
+    )
+    observed_grid_size = inspection.input_shape[1] if len(inspection.input_shape) > 1 else None
+    results.append(
+        CheckResult(
+            name="dataset_grid_size",
+            status="passed" if expected_grid_size == observed_grid_size else "failed",
+            severity="error" if expected_grid_size != observed_grid_size else "info",
+            message="Compared configured grid size with observed sample shape.",
+            details={
+                "expected_grid_size": expected_grid_size,
+                "observed_grid_size": observed_grid_size,
+            },
+        )
+    )
+    results.append(
+        CheckResult(
+            name="dataset_finite_values",
+            status="passed" if not inspection.contains_nan and not inspection.contains_inf else "failed",
+            severity="error" if inspection.contains_nan or inspection.contains_inf else "info",
+            message="Checked dataset sample arrays for NaN/Inf.",
+            details={
+                "contains_nan": inspection.contains_nan,
+                "contains_inf": inspection.contains_inf,
+            },
+        )
+    )
+    return results
+
+
 def build_requested_check_statuses(config: dict[str, Any]) -> list[dict[str, Any]]:
     checks = config.get("checks", {})
     if not isinstance(checks, dict):
@@ -300,6 +397,9 @@ def resolve_path(path_value: str | Path, repo_root: Path) -> Path:
     path = Path(path_value)
     if path.is_absolute():
         return path
+    cwd_candidate = path.resolve()
+    if cwd_candidate.exists():
+        return cwd_candidate
     return (repo_root / path).resolve()
 
 
@@ -336,6 +436,7 @@ def build_report(
         validate_required_fields(config)
         + validate_repo_layout(repo_root)
         + validate_configured_paths(config, repo_root)
+        + validate_dataset_manifest(config, repo_root)
     )
     summary = summarize_results(performed_checks)
 
