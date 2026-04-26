@@ -188,6 +188,36 @@ def flatten_residual_problem(split_payload: dict[str, np.ndarray]) -> tuple[np.n
     )
 
 
+def lift_residual_features(inputs: np.ndarray) -> np.ndarray:
+    """Build a richer feature bank for the numpy residual fallback.
+
+    This keeps the training path lightweight while still expressing more of the
+    nonlinear coupling structure than a plain linear fit on raw channels.
+    """
+
+    feature_blocks = [
+        inputs,
+        inputs**2,
+        inputs**3,
+        inputs[:, 0:1] * inputs[:, 5:6],
+        inputs[:, 1:2] * inputs[:, 5:6],
+        inputs[:, 2:3] * inputs[:, 5:6],
+        inputs[:, 3:4] * inputs[:, 5:6],
+        np.sin(np.pi * inputs[:, 4:5]),
+        np.cos(np.pi * inputs[:, 4:5]),
+    ]
+    return np.concatenate(feature_blocks, axis=1)
+
+
+def weighted_total_from_metrics(metrics: dict[str, float], weights: dict[str, float]) -> float:
+    return (
+        weights.get("l2", 0.0) * metrics.get("rel_l2", 0.0)
+        + weights.get("pde", 0.0) * metrics.get("pde_residual", 0.0)
+        + weights.get("bc", 0.0) * metrics.get("bc_violation", 0.0)
+        + weights.get("conservation", 0.0) * metrics.get("conservation_error", 0.0)
+    )
+
+
 def compute_numpy_residual_metrics(
     predicted_residual: np.ndarray,
     split_payload: dict[str, np.ndarray],
@@ -218,18 +248,68 @@ def fit_numpy_residual_model(config: dict[str, Any], dataset_payloads: dict[str,
     train_x, train_residual_y, _ = flatten_residual_problem(dataset_payloads["train"])
     val_x, _, _ = flatten_residual_problem(dataset_payloads["val"])
 
-    train_aug = np.concatenate([train_x, np.ones((train_x.shape[0], 1))], axis=1)
-    val_aug = np.concatenate([val_x, np.ones((val_x.shape[0], 1))], axis=1)
-    ridge = 1e-6
+    lifted_train = lift_residual_features(train_x)
+    lifted_val = lift_residual_features(val_x)
+    feature_mean = lifted_train.mean(axis=0, keepdims=True)
+    feature_std = lifted_train.std(axis=0, keepdims=True)
+    feature_std = np.where(feature_std < 1e-6, 1.0, feature_std)
+    train_norm = (lifted_train - feature_mean) / feature_std
+    val_norm = (lifted_val - feature_mean) / feature_std
+
+    train_aug = np.concatenate([train_norm, np.ones((train_norm.shape[0], 1))], axis=1)
+    val_aug = np.concatenate([val_norm, np.ones((val_norm.shape[0], 1))], axis=1)
+
+    train_cfg = config.get("train", {})
+    num_epochs = int(train_cfg.get("epochs", 120))
+    learning_rate = float(train_cfg.get("learning_rate", 1e-3))
+    ridge = 1e-5
+    loss_weights = {
+        "l2": float(config.get("loss", {}).get("l2", 1.0)),
+        "pde": float(config.get("loss", {}).get("pde", 0.0)),
+        "bc": float(config.get("loss", {}).get("bc", 0.0)),
+        "conservation": float(config.get("loss", {}).get("conservation", 0.0)),
+    }
+
     gram = train_aug.T @ train_aug + ridge * np.eye(train_aug.shape[1])
     weights = np.linalg.solve(gram, train_aug.T @ train_residual_y)
+
+    history: list[dict[str, float]] = []
+    for epoch in range(1, num_epochs + 1):
+        train_pred = train_aug @ weights
+        error = train_pred - train_residual_y
+        gradient = (train_aug.T @ error) / float(train_aug.shape[0])
+        gradient[:-1] += ridge * weights[:-1]
+        weights = weights - learning_rate * gradient
+
+        if epoch == 1 or epoch == num_epochs or epoch % max(num_epochs // 10, 1) == 0:
+            val_pred = val_aug @ weights
+            train_metrics = compute_numpy_residual_metrics(train_pred, dataset_payloads["train"])
+            val_metrics = compute_numpy_residual_metrics(val_pred, dataset_payloads["val"])
+            history.append(
+                {
+                    "epoch": float(epoch),
+                    "train_rel_l2": train_metrics["rel_l2"],
+                    "val_rel_l2": val_metrics["rel_l2"],
+                    "train_total": weighted_total_from_metrics(train_metrics, loss_weights),
+                    "val_total": weighted_total_from_metrics(val_metrics, loss_weights),
+                }
+            )
+
     train_pred = train_aug @ weights
     val_pred = val_aug @ weights
-
     train_metrics = compute_numpy_residual_metrics(train_pred, dataset_payloads["train"])
     val_metrics = compute_numpy_residual_metrics(val_pred, dataset_payloads["val"])
+    train_metrics["total"] = weighted_total_from_metrics(train_metrics, loss_weights)
+    val_metrics["total"] = weighted_total_from_metrics(val_metrics, loss_weights)
     return {
-        "backend": "numpy-linear-residual",
+        "backend": "numpy-lifted-residual",
+        "lifted_feature_dim": int(lifted_train.shape[1]),
+        "epochs": num_epochs,
+        "learning_rate": learning_rate,
+        "ridge": ridge,
+        "feature_mean": feature_mean.astype(np.float32).reshape(-1).tolist(),
+        "feature_std": feature_std.astype(np.float32).reshape(-1).tolist(),
+        "history": history,
         "weights": weights.astype(np.float32).tolist(),
         "train_metrics": train_metrics,
         "val_metrics": val_metrics,
@@ -451,14 +531,14 @@ def main() -> None:
             {
                 "run_id": run_name,
                 "stage": stage,
-                "epoch": 1,
+                "epoch": fit_result.get("epochs", 1),
                 "split": "train",
                 "tag": fit_result["backend"],
                 "rel_l2": fit_result["train_metrics"]["rel_l2"],
                 "pde_residual": fit_result["train_metrics"]["pde_residual"],
                 "bc_violation": fit_result["train_metrics"]["bc_violation"],
                 "conservation_error": fit_result["train_metrics"]["conservation_error"],
-                "total": "",
+                "total": fit_result["train_metrics"].get("total", ""),
                 "status": "trained",
             },
         )
@@ -467,19 +547,19 @@ def main() -> None:
             {
                 "run_id": run_name,
                 "stage": stage,
-                "epoch": 1,
+                "epoch": fit_result.get("epochs", 1),
                 "split": "val",
                 "tag": fit_result["backend"],
                 "rel_l2": fit_result["val_metrics"]["rel_l2"],
                 "pde_residual": fit_result["val_metrics"]["pde_residual"],
                 "bc_violation": fit_result["val_metrics"]["bc_violation"],
                 "conservation_error": fit_result["val_metrics"]["conservation_error"],
-                "total": "",
+                "total": fit_result["val_metrics"].get("total", ""),
                 "status": "evaluated",
             },
         )
         save_summary(output_plan["summary_json"], summary)
-        save_checkpoint(output_plan["checkpoint"], model={"backend": "numpy-linear-residual"}, metadata=summary)
+        save_checkpoint(output_plan["checkpoint"], model={"backend": fit_result["backend"]}, metadata=summary)
         output_plan["log_file"].write_text(
             json.dumps(summary, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
