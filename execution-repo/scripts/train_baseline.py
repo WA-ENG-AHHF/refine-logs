@@ -26,6 +26,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from models.fno_baseline import FNOBaselineStub, TORCH_AVAILABLE
 from datasets import inspect_dataset_manifest, load_split_arrays
+from training import compute_direct_metrics_numpy, fit_torch_direct_supervised, set_global_seed
 
 
 @dataclass
@@ -207,12 +208,6 @@ def count_parameters(model: Any) -> int:
     return 0
 
 
-def rel_l2(predictions: np.ndarray, targets: np.ndarray) -> float:
-    numerator = float(np.linalg.norm(predictions - targets))
-    denominator = float(np.linalg.norm(targets))
-    return numerator / max(denominator, 1e-8)
-
-
 def load_training_data(config: dict[str, Any]) -> dict[str, dict[str, np.ndarray]]:
     dataset_cfg = config.get("dataset", {})
     manifest_path = Path(str(dataset_cfg.get("manifest_path", "")))
@@ -231,7 +226,7 @@ def flatten_supervised_arrays(split_payload: dict[str, np.ndarray]) -> tuple[np.
 
 
 def fit_numpy_linear_baseline(
-    train_payload: dict[str, np.ndarray], val_payload: dict[str, np.ndarray]
+    train_payload: dict[str, np.ndarray], val_payload: dict[str, np.ndarray], config: dict[str, Any]
 ) -> dict[str, Any]:
     train_x, train_y = flatten_supervised_arrays(train_payload)
     val_x, val_y = flatten_supervised_arrays(val_payload)
@@ -244,10 +239,31 @@ def fit_numpy_linear_baseline(
 
     train_pred = train_aug @ weights
     val_pred = val_aug @ weights
+    loss_weights = {
+        "l2": float(config.get("loss", {}).get("l2", 1.0)),
+        "pde": float(config.get("loss", {}).get("pde", 0.0)),
+        "bc": float(config.get("loss", {}).get("bc", 0.0)),
+        "conservation": float(config.get("loss", {}).get("conservation", 0.0)),
+    }
+    train_pred_seq = train_pred.reshape(train_payload["targets"].shape)
+    val_pred_seq = val_pred.reshape(val_payload["targets"].shape)
+    train_metrics = compute_direct_metrics_numpy(train_pred_seq, train_payload["targets"], loss_weights)
+    val_metrics = compute_direct_metrics_numpy(val_pred_seq, val_payload["targets"], loss_weights)
     return {
         "backend": "numpy-linear",
-        "train_rel_l2": rel_l2(train_pred, train_y),
-        "val_rel_l2": rel_l2(val_pred, val_y),
+        "epochs": 1,
+        "best_epoch": 1,
+        "train_metrics": train_metrics,
+        "val_metrics": val_metrics,
+        "history": [
+            {
+                "epoch": 1.0,
+                "train_rel_l2": train_metrics["rel_l2"],
+                "val_rel_l2": val_metrics["rel_l2"],
+                "train_total": train_metrics["total"],
+                "val_total": val_metrics["total"],
+            }
+        ],
         "weights": weights.astype(np.float32).tolist(),
         "train_samples": int(train_payload["inputs"].shape[0]),
         "val_samples": int(val_payload["inputs"].shape[0]),
@@ -268,6 +284,7 @@ def write_metrics_rows(metrics_path: Path, rows: list[dict[str, Any]]) -> None:
                 "pde_residual",
                 "bc_violation",
                 "conservation_error",
+                "total",
                 "status",
             ],
         )
@@ -334,7 +351,7 @@ def write_summary(
     training_results: dict[str, Any],
 ) -> None:
     summary = {
-        "status": "trained_minimal_baseline",
+        "status": "trained_baseline",
         "stage": config.get("stage", "S1"),
         "run_name": run_name,
         "config_path": str(config_path),
@@ -353,7 +370,8 @@ def write_summary(
         "artifacts": {key: str(value) for key, value in asdict(artifacts).items()},
         "notes": [
             "This run consumed manifest-backed dataset files.",
-            "The baseline uses a minimal training path for environment portability.",
+            "Torch environments use a real epoch-based supervised loop.",
+            "Torch-free environments retain a portable numpy fallback.",
         ],
     }
     with summary_path.open("w", encoding="utf-8") as handle:
@@ -370,7 +388,21 @@ def main() -> None:
     artifacts = prepare_artifacts(config, run_name)
     model = build_model(config)
     split_payloads = load_training_data(config)
-    training_results = fit_numpy_linear_baseline(split_payloads["train"], split_payloads["val"])
+    train_cfg = config.get("train", {}) or {}
+    set_global_seed(int(train_cfg.get("seed", 42)))
+    best_state_dict: dict[str, Any] | None = None
+    if TORCH_AVAILABLE:
+        from models.losses import build_loss_breakdown
+
+        training_results, best_state_dict = fit_torch_direct_supervised(
+            model=model,
+            train_payload=split_payloads["train"],
+            val_payload=split_payloads["val"],
+            config=config,
+            build_loss_breakdown=build_loss_breakdown,
+        )
+    else:
+        training_results = fit_numpy_linear_baseline(split_payloads["train"], split_payloads["val"], config)
 
     write_metrics_rows(
         artifacts.metrics_path,
@@ -378,25 +410,27 @@ def main() -> None:
             {
                 "run_id": run_name,
                 "stage": "S1",
-                "epoch": 1,
+                "epoch": training_results.get("best_epoch", training_results.get("epochs", 1)),
                 "split": "train",
                 "tag": training_results["backend"],
-                "rel_l2": training_results["train_rel_l2"],
-                "pde_residual": "",
-                "bc_violation": "",
-                "conservation_error": "",
+                "rel_l2": training_results["train_metrics"]["rel_l2"],
+                "pde_residual": training_results["train_metrics"].get("pde_residual", ""),
+                "bc_violation": training_results["train_metrics"].get("bc_violation", ""),
+                "conservation_error": training_results["train_metrics"].get("conservation_error", ""),
+                "total": training_results["train_metrics"].get("total", ""),
                 "status": "trained",
             },
             {
                 "run_id": run_name,
                 "stage": "S1",
-                "epoch": 1,
+                "epoch": training_results.get("best_epoch", training_results.get("epochs", 1)),
                 "split": "val",
                 "tag": training_results["backend"],
-                "rel_l2": training_results["val_rel_l2"],
-                "pde_residual": "",
-                "bc_violation": "",
-                "conservation_error": "",
+                "rel_l2": training_results["val_metrics"]["rel_l2"],
+                "pde_residual": training_results["val_metrics"].get("pde_residual", ""),
+                "bc_violation": training_results["val_metrics"].get("bc_violation", ""),
+                "conservation_error": training_results["val_metrics"].get("conservation_error", ""),
+                "total": training_results["val_metrics"].get("total", ""),
                 "status": "evaluated",
             },
         ],
@@ -404,6 +438,8 @@ def main() -> None:
     write_resolved_config(config, artifacts, run_name)
 
     finished_at = utc_now()
+    if best_state_dict is not None and hasattr(model, "load_state_dict"):
+        model.load_state_dict(best_state_dict)
     save_checkpoint_metadata(
         artifacts.checkpoint_path,
         config,
@@ -411,12 +447,14 @@ def main() -> None:
         started_at,
         finished_at,
         training_state={
-            "epoch": 1,
-            "global_step": int(split_payloads["train"]["inputs"].shape[0]),
-            "status": "trained_minimal_baseline",
+            "epoch": int(training_results.get("best_epoch", training_results.get("epochs", 1))),
+            "global_step": int(
+                training_results.get("epochs", 1) * split_payloads["train"]["inputs"].shape[0]
+            ),
+            "status": "trained_baseline",
             "backend": training_results["backend"],
-            "train_rel_l2": training_results["train_rel_l2"],
-            "val_rel_l2": training_results["val_rel_l2"],
+            "train_rel_l2": training_results["train_metrics"]["rel_l2"],
+            "val_rel_l2": training_results["val_metrics"]["rel_l2"],
         },
     )
     write_summary(
@@ -436,8 +474,8 @@ def main() -> None:
     print(f"Summary: {artifacts.summary_path}")
     print(f"Checkpoint metadata: {artifacts.checkpoint_path}")
     print(f"Metrics: {artifacts.metrics_path}")
-    print(f"Train rel-L2: {training_results['train_rel_l2']:.6f}")
-    print(f"Val rel-L2: {training_results['val_rel_l2']:.6f}")
+    print(f"Train rel-L2: {training_results['train_metrics']['rel_l2']:.6f}")
+    print(f"Val rel-L2: {training_results['val_metrics']['rel_l2']:.6f}")
 
 
 if __name__ == "__main__":

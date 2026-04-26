@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -33,6 +34,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from datasets import inspect_dataset_manifest, load_split_arrays
+from training import fit_torch_residual_supervised, set_global_seed
 
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments for the scaffold runner."""
@@ -389,45 +391,6 @@ def build_model_config(config: dict[str, Any]) -> PCRNOConfig:
     )
 
 
-def synthetic_batch(
-    model_cfg: Any,
-    device: Any,
-) -> tuple[Any, Any]:
-    """Generate a synthetic batch so the scaffold can run before data plumbing exists."""
-
-    features = torch.randn(
-        model_cfg.batch_size,
-        model_cfg.sequence_length,
-        model_cfg.input_dim,
-        device=device,
-    )
-    targets = torch.randn(
-        model_cfg.batch_size,
-        model_cfg.sequence_length,
-        model_cfg.output_dim,
-        device=device,
-    )
-    return features, targets
-
-
-def run_training_step(
-    model: Any,
-    optimizer: Any,
-    features: Any,
-    targets: Any,
-    loss_weights: dict[str, float],
-) -> dict[str, float]:
-    """Execute one synthetic optimization step and return scalar metrics."""
-
-    optimizer.zero_grad(set_to_none=True)
-    build_loss_breakdown, _, _ = load_training_components()
-    predictions = model(features)
-    losses = build_loss_breakdown(predictions=predictions, targets=targets, weights=loss_weights)
-    losses["total"].backward()
-    optimizer.step()
-    return {name: float(value.detach().cpu().item()) for name, value in losses.items()}
-
-
 def append_metrics_row(metrics_csv: Path, row: dict[str, Any]) -> None:
     """Append a metrics row, creating the CSV header when needed."""
 
@@ -444,12 +407,24 @@ def append_metrics_row(metrics_csv: Path, row: dict[str, Any]) -> None:
         "total",
         "status",
     ]
-    write_header = not metrics_csv.exists()
-    with metrics_csv.open("a", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        if write_header:
-            writer.writeheader()
-        writer.writerow({name: row.get(name, "") for name in fieldnames})
+    try:
+        write_header = not metrics_csv.exists()
+        with metrics_csv.open("a", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            if write_header:
+                writer.writeheader()
+            writer.writerow({name: row.get(name, "") for name in fieldnames})
+        return
+    except PermissionError:
+        fallback_csv = metrics_csv.with_name(
+            f"{metrics_csv.stem}_fallback_pid{os.getpid()}{metrics_csv.suffix}"
+        )
+        write_header = not fallback_csv.exists()
+        with fallback_csv.open("a", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            if write_header:
+                writer.writeheader()
+            writer.writerow({name: row.get(name, "") for name in fieldnames})
 
 
 def save_summary(summary_json: Path, payload: dict[str, Any]) -> None:
@@ -571,19 +546,24 @@ def main() -> None:
     device = choose_device(args.device)
     model_cfg = build_model_config(config)
     model = pcr_model_cls(model_cfg).to(device)
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=float(config.get("train", {}).get("learning_rate", 1e-3)),
-    )
     loss_weights = {
         name: float(value)
         for name, value in (config.get("loss", {}) or {}).items()
     }
-    features, targets = synthetic_batch(model_cfg=model_cfg, device=device)
     summary["device"] = str(device)
     summary["model"] = model_cfg.to_dict()
+    train_cfg = config.get("train", {}) or {}
+    set_global_seed(int(train_cfg.get("seed", 42)))
 
     if args.dry_run:
+        features = torch.tensor(
+            np.asarray(dataset_payloads["train"]["inputs"][:1], dtype=np.float32),
+            device=device,
+        )
+        targets = torch.tensor(
+            np.asarray(dataset_payloads["train"]["residual_targets"][:1], dtype=np.float32),
+            device=device,
+        )
         dry_losses = build_loss_breakdown(
             predictions=model(features),
             targets=targets,
@@ -597,28 +577,47 @@ def main() -> None:
         return
 
     ensure_output_dirs(output_plan)
-    metrics = run_training_step(
+    fit_result, best_state_dict = fit_torch_residual_supervised(
         model=model,
-        optimizer=optimizer,
-        features=features,
-        targets=targets,
-        loss_weights=loss_weights,
+        train_payload=dataset_payloads["train"],
+        val_payload=dataset_payloads["val"],
+        config=config,
+        build_loss_breakdown=build_loss_breakdown,
+        device=str(device),
     )
-    summary["final_metrics"] = metrics
+    if hasattr(model, "load_state_dict"):
+        model.load_state_dict(best_state_dict)
+    summary["training_results"] = fit_result
     append_metrics_row(
         output_plan["metrics_csv"],
         {
             "run_id": run_name,
             "stage": stage,
-            "epoch": 1,
+            "epoch": fit_result.get("best_epoch", fit_result.get("epochs", 1)),
             "split": "train",
-            "tag": "synthetic_step",
-            "rel_l2": metrics.get("l2", ""),
-            "pde_residual": metrics.get("pde", ""),
-            "bc_violation": metrics.get("bc", ""),
-            "conservation_error": metrics.get("conservation", ""),
-            "total": metrics.get("total", ""),
-            "status": "synthetic_train_step",
+            "tag": fit_result["backend"],
+            "rel_l2": fit_result["train_metrics"]["rel_l2"],
+            "pde_residual": fit_result["train_metrics"]["pde_residual"],
+            "bc_violation": fit_result["train_metrics"]["bc_violation"],
+            "conservation_error": fit_result["train_metrics"]["conservation_error"],
+            "total": fit_result["train_metrics"].get("total", ""),
+            "status": "trained",
+        },
+    )
+    append_metrics_row(
+        output_plan["metrics_csv"],
+        {
+            "run_id": run_name,
+            "stage": stage,
+            "epoch": fit_result.get("best_epoch", fit_result.get("epochs", 1)),
+            "split": "val",
+            "tag": fit_result["backend"],
+            "rel_l2": fit_result["val_metrics"]["rel_l2"],
+            "pde_residual": fit_result["val_metrics"]["pde_residual"],
+            "bc_violation": fit_result["val_metrics"]["bc_violation"],
+            "conservation_error": fit_result["val_metrics"]["conservation_error"],
+            "total": fit_result["val_metrics"].get("total", ""),
+            "status": "evaluated",
         },
     )
     save_summary(output_plan["summary_json"], summary)
