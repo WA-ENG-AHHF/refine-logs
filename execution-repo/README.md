@@ -51,7 +51,9 @@ Prefer separate modules over shared edits when two agents are active at the same
 
 ```bash
 pip install -r requirements.txt
+python scripts/prepare_sample_dataset.py
 python scripts/run_sanity_check.py
+python scripts/run_wave1_pipeline.py --run-prefix smoke
 ```
 
 ## Expected evolution
@@ -62,3 +64,54 @@ This scaffold should gradually grow into:
 - PCR projection layer
 - equation-wise residual heads
 - shared metrics and plotting utilities
+
+## Smoke pipeline
+
+Use the integration runner to exercise the current scaffold end to end:
+
+```bash
+python scripts/run_wave1_pipeline.py --run-prefix smoke
+```
+
+This currently runs:
+- `S0` sanity validation
+- `S1` baseline scaffold initialization
+- `S2` PCR-NO dry-run validation
+- metrics aggregation into `results/MASTER_METRICS.csv`
+
+## Sample dataset path
+
+The repo now includes a tiny local-data workflow:
+
+```bash
+python scripts/prepare_sample_dataset.py
+```
+
+This writes a small manifest-based dataset under `data/sample_adr/`, which is ignored by Git but usable by `S0` and `S1` for local validation.
+
+## Formal coupled PDE dataset pipeline
+
+Generate the first research-oriented coupled ADR dataset with:
+
+```bash
+python scripts/prepare_coupled_pde_dataset.py --config configs/DATASET_coupled_adr.yaml
+```
+
+Then validate and run the scaffold pipeline against the generated data:
+
+```bash
+python scripts/run_sanity_check.py --config configs/S0_coupled_adr.yaml
+python scripts/run_wave1_pipeline.py ^
+  --run-prefix coupled_adr ^
+  --s0-config configs/S0_coupled_adr.yaml ^
+  --s1-config configs/S1_baseline_coupled_adr.yaml ^
+  --s2-config configs/S2_main_coupled_adr.yaml
+```
+
+The generated formal dataset uses:
+- coarse grid size `16`
+- fine grid size `64`
+- two coupled fields `u` and `v`
+- six input channels: interpolated coarse fields, two source channels, coordinate, coupling
+- two target channels: fine `u` and fine `v`
+- residual targets saved alongside direct fine-state targets

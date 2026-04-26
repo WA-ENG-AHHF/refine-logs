@@ -10,11 +10,14 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
 from types import ModuleType
 from typing import Any
+
+import numpy as np
 
 try:
     import yaml
@@ -29,6 +32,9 @@ except ModuleNotFoundError:
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+from datasets import inspect_dataset_manifest, load_split_arrays
+from training import fit_torch_residual_supervised, set_global_seed
 
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments for the scaffold runner."""
@@ -139,6 +145,179 @@ def load_training_components() -> tuple[ModuleType, Any, Any]:
     return build_loss_breakdown, PCRNO, PCRNOConfig
 
 
+def rel_l2(predictions: np.ndarray, targets: np.ndarray) -> float:
+    numerator = float(np.linalg.norm(predictions - targets))
+    denominator = float(np.linalg.norm(targets))
+    return numerator / max(denominator, 1e-8)
+
+
+def load_dataset_payloads(config: dict[str, Any]) -> dict[str, Any]:
+    dataset_cfg = config.get("dataset", {})
+    if not isinstance(dataset_cfg, dict) or "manifest_path" not in dataset_cfg:
+        return {"status": "not_configured"}
+
+    manifest_path = Path(str(dataset_cfg["manifest_path"]))
+    if not manifest_path.is_absolute():
+        manifest_path = (REPO_ROOT / manifest_path).resolve()
+
+    return {
+        "status": "loaded",
+        "manifest_path": str(manifest_path),
+        "inspection": inspect_dataset_manifest(manifest_path).to_dict(),
+        "train": load_split_arrays(manifest_path, "train"),
+        "val": load_split_arrays(manifest_path, "val"),
+    }
+
+
+def dataset_summary_view(dataset_payload: dict[str, Any]) -> dict[str, Any]:
+    if dataset_payload.get("status") != "loaded":
+        return dataset_payload
+    return {
+        "status": dataset_payload["status"],
+        "manifest_path": dataset_payload["manifest_path"],
+        "inspection": dataset_payload["inspection"],
+    }
+
+
+def flatten_residual_problem(split_payload: dict[str, np.ndarray]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    inputs = np.asarray(split_payload["inputs"], dtype=np.float64)
+    residual_targets = np.asarray(split_payload["residual_targets"], dtype=np.float64)
+    fine_targets = np.asarray(split_payload["targets"], dtype=np.float64)
+    return (
+        inputs.reshape(-1, inputs.shape[-1]),
+        residual_targets.reshape(-1, residual_targets.shape[-1]),
+        fine_targets.reshape(-1, fine_targets.shape[-1]),
+    )
+
+
+def lift_residual_features(inputs: np.ndarray) -> np.ndarray:
+    """Build a richer feature bank for the numpy residual fallback.
+
+    This keeps the training path lightweight while still expressing more of the
+    nonlinear coupling structure than a plain linear fit on raw channels.
+    """
+
+    feature_blocks = [
+        inputs,
+        inputs**2,
+        inputs**3,
+        inputs[:, 0:1] * inputs[:, 5:6],
+        inputs[:, 1:2] * inputs[:, 5:6],
+        inputs[:, 2:3] * inputs[:, 5:6],
+        inputs[:, 3:4] * inputs[:, 5:6],
+        np.sin(np.pi * inputs[:, 4:5]),
+        np.cos(np.pi * inputs[:, 4:5]),
+    ]
+    return np.concatenate(feature_blocks, axis=1)
+
+
+def weighted_total_from_metrics(metrics: dict[str, float], weights: dict[str, float]) -> float:
+    return (
+        weights.get("l2", 0.0) * metrics.get("rel_l2", 0.0)
+        + weights.get("pde", 0.0) * metrics.get("pde_residual", 0.0)
+        + weights.get("bc", 0.0) * metrics.get("bc_violation", 0.0)
+        + weights.get("conservation", 0.0) * metrics.get("conservation_error", 0.0)
+    )
+
+
+def compute_numpy_residual_metrics(
+    predicted_residual: np.ndarray,
+    split_payload: dict[str, np.ndarray],
+) -> dict[str, float]:
+    residual_targets = np.asarray(split_payload["residual_targets"], dtype=np.float64)
+    fine_targets = np.asarray(split_payload["targets"], dtype=np.float64)
+    coarse_interp = np.asarray(split_payload["coarse_interp"], dtype=np.float64)
+    pred_residual = predicted_residual.reshape(residual_targets.shape)
+    reconstructed = coarse_interp + pred_residual
+    boundary_error = float(np.mean(np.abs(reconstructed[:, [0, -1], :] - fine_targets[:, [0, -1], :])))
+    conservation_error = float(
+        np.mean(
+            np.abs(
+                reconstructed.sum(axis=1) - fine_targets.sum(axis=1)
+            )
+        )
+    )
+    residual_mae = float(np.mean(np.abs(pred_residual - residual_targets)))
+    return {
+        "rel_l2": rel_l2(reconstructed, fine_targets),
+        "pde_residual": residual_mae,
+        "bc_violation": boundary_error,
+        "conservation_error": conservation_error,
+    }
+
+
+def fit_numpy_residual_model(config: dict[str, Any], dataset_payloads: dict[str, Any]) -> dict[str, Any]:
+    train_x, train_residual_y, _ = flatten_residual_problem(dataset_payloads["train"])
+    val_x, _, _ = flatten_residual_problem(dataset_payloads["val"])
+
+    lifted_train = lift_residual_features(train_x)
+    lifted_val = lift_residual_features(val_x)
+    feature_mean = lifted_train.mean(axis=0, keepdims=True)
+    feature_std = lifted_train.std(axis=0, keepdims=True)
+    feature_std = np.where(feature_std < 1e-6, 1.0, feature_std)
+    train_norm = (lifted_train - feature_mean) / feature_std
+    val_norm = (lifted_val - feature_mean) / feature_std
+
+    train_aug = np.concatenate([train_norm, np.ones((train_norm.shape[0], 1))], axis=1)
+    val_aug = np.concatenate([val_norm, np.ones((val_norm.shape[0], 1))], axis=1)
+
+    train_cfg = config.get("train", {})
+    num_epochs = int(train_cfg.get("epochs", 120))
+    learning_rate = float(train_cfg.get("learning_rate", 1e-3))
+    ridge = 1e-5
+    loss_weights = {
+        "l2": float(config.get("loss", {}).get("l2", 1.0)),
+        "pde": float(config.get("loss", {}).get("pde", 0.0)),
+        "bc": float(config.get("loss", {}).get("bc", 0.0)),
+        "conservation": float(config.get("loss", {}).get("conservation", 0.0)),
+    }
+
+    gram = train_aug.T @ train_aug + ridge * np.eye(train_aug.shape[1])
+    weights = np.linalg.solve(gram, train_aug.T @ train_residual_y)
+
+    history: list[dict[str, float]] = []
+    for epoch in range(1, num_epochs + 1):
+        train_pred = train_aug @ weights
+        error = train_pred - train_residual_y
+        gradient = (train_aug.T @ error) / float(train_aug.shape[0])
+        gradient[:-1] += ridge * weights[:-1]
+        weights = weights - learning_rate * gradient
+
+        if epoch == 1 or epoch == num_epochs or epoch % max(num_epochs // 10, 1) == 0:
+            val_pred = val_aug @ weights
+            train_metrics = compute_numpy_residual_metrics(train_pred, dataset_payloads["train"])
+            val_metrics = compute_numpy_residual_metrics(val_pred, dataset_payloads["val"])
+            history.append(
+                {
+                    "epoch": float(epoch),
+                    "train_rel_l2": train_metrics["rel_l2"],
+                    "val_rel_l2": val_metrics["rel_l2"],
+                    "train_total": weighted_total_from_metrics(train_metrics, loss_weights),
+                    "val_total": weighted_total_from_metrics(val_metrics, loss_weights),
+                }
+            )
+
+    train_pred = train_aug @ weights
+    val_pred = val_aug @ weights
+    train_metrics = compute_numpy_residual_metrics(train_pred, dataset_payloads["train"])
+    val_metrics = compute_numpy_residual_metrics(val_pred, dataset_payloads["val"])
+    train_metrics["total"] = weighted_total_from_metrics(train_metrics, loss_weights)
+    val_metrics["total"] = weighted_total_from_metrics(val_metrics, loss_weights)
+    return {
+        "backend": "numpy-lifted-residual",
+        "lifted_feature_dim": int(lifted_train.shape[1]),
+        "epochs": num_epochs,
+        "learning_rate": learning_rate,
+        "ridge": ridge,
+        "feature_mean": feature_mean.astype(np.float32).reshape(-1).tolist(),
+        "feature_std": feature_std.astype(np.float32).reshape(-1).tolist(),
+        "history": history,
+        "weights": weights.astype(np.float32).tolist(),
+        "train_metrics": train_metrics,
+        "val_metrics": val_metrics,
+    }
+
+
 def choose_device(explicit: str | None) -> Any:
     """Select a torch device with a stable CPU fallback."""
 
@@ -169,12 +348,14 @@ def resolve_output_plan(
 
     stage = str(config.get("stage", "S2"))
     output_cfg = config.get("output", {})
+    root_dir = REPO_ROOT / str(output_cfg.get("root_dir", f"outputs/{stage}"))
+    run_dir = root_dir / run_name
     checkpoint = REPO_ROOT / str(output_cfg.get("checkpoint", f"checkpoints/{stage}_best.pt"))
     metrics_csv = REPO_ROOT / str(
         output_cfg.get("metrics_csv", f"results/{stage}_metric_comparison.csv")
     )
-    log_file = REPO_ROOT / "logs" / run_name / "train.log"
-    summary_json = REPO_ROOT / "reports" / f"{run_name}_summary.json"
+    log_file = run_dir / "logs" / "train.log"
+    summary_json = run_dir / "reports" / "run_summary.json"
     return {
         "checkpoint": checkpoint,
         "metrics_csv": metrics_csv,
@@ -210,55 +391,40 @@ def build_model_config(config: dict[str, Any]) -> PCRNOConfig:
     )
 
 
-def synthetic_batch(
-    model_cfg: Any,
-    device: Any,
-) -> tuple[Any, Any]:
-    """Generate a synthetic batch so the scaffold can run before data plumbing exists."""
-
-    features = torch.randn(
-        model_cfg.batch_size,
-        model_cfg.sequence_length,
-        model_cfg.input_dim,
-        device=device,
-    )
-    targets = torch.randn(
-        model_cfg.batch_size,
-        model_cfg.sequence_length,
-        model_cfg.output_dim,
-        device=device,
-    )
-    return features, targets
-
-
-def run_training_step(
-    model: Any,
-    optimizer: Any,
-    features: Any,
-    targets: Any,
-    loss_weights: dict[str, float],
-) -> dict[str, float]:
-    """Execute one synthetic optimization step and return scalar metrics."""
-
-    optimizer.zero_grad(set_to_none=True)
-    build_loss_breakdown, _, _ = load_training_components()
-    predictions = model(features)
-    losses = build_loss_breakdown(predictions=predictions, targets=targets, weights=loss_weights)
-    losses["total"].backward()
-    optimizer.step()
-    return {name: float(value.detach().cpu().item()) for name, value in losses.items()}
-
-
 def append_metrics_row(metrics_csv: Path, row: dict[str, Any]) -> None:
     """Append a metrics row, creating the CSV header when needed."""
 
-    fieldnames = list(row.keys())
-    write_header = not metrics_csv.exists()
-    with metrics_csv.open("a", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        if write_header:
-            writer.writeheader()
-        writer.writerow(row)
+    fieldnames = [
+        "run_id",
+        "stage",
+        "epoch",
+        "split",
+        "tag",
+        "rel_l2",
+        "pde_residual",
+        "bc_violation",
+        "conservation_error",
+        "total",
+        "status",
+    ]
+    try:
+        write_header = not metrics_csv.exists()
+        with metrics_csv.open("a", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            if write_header:
+                writer.writeheader()
+            writer.writerow({name: row.get(name, "") for name in fieldnames})
+        return
+    except PermissionError:
+        fallback_csv = metrics_csv.with_name(
+            f"{metrics_csv.stem}_fallback_pid{os.getpid()}{metrics_csv.suffix}"
+        )
+        write_header = not fallback_csv.exists()
+        with fallback_csv.open("a", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            if write_header:
+                writer.writeheader()
+            writer.writerow({name: row.get(name, "") for name in fieldnames})
 
 
 def save_summary(summary_json: Path, payload: dict[str, Any]) -> None:
@@ -268,12 +434,13 @@ def save_summary(summary_json: Path, payload: dict[str, Any]) -> None:
         json.dump(payload, handle, indent=2, sort_keys=True)
 
 
-def save_checkpoint(checkpoint_path: Path, model: PCRNO, metadata: dict[str, Any]) -> None:
+def save_checkpoint(checkpoint_path: Path, model: Any, metadata: dict[str, Any]) -> None:
     """Save the scaffold model state together with simple run metadata."""
 
-    if torch is None:
-        raise RuntimeError("torch is required to save checkpoints.")
-    torch.save({"model_state_dict": model.state_dict(), "metadata": metadata}, checkpoint_path)
+    if torch is not None and hasattr(model, "state_dict"):
+        torch.save({"model_state_dict": model.state_dict(), "metadata": metadata}, checkpoint_path)
+        return
+    checkpoint_path.write_text(json.dumps({"metadata": metadata}, indent=2), encoding="utf-8")
 
 
 def main() -> None:
@@ -290,7 +457,10 @@ def main() -> None:
         "config_path": str(args.config.resolve()),
         "outputs": {name: str(path) for name, path in output_plan.items()},
         "torch_available": torch is not None,
+        "dataset": {},
     }
+    dataset_payloads = load_dataset_payloads(config)
+    summary["dataset"] = dataset_summary_view(dataset_payloads)
 
     if args.dry_run and torch is None:
         summary["device"] = args.device or "unavailable"
@@ -312,23 +482,88 @@ def main() -> None:
         print(json.dumps(summary, indent=2, sort_keys=True))
         return
 
+    if torch is None:
+        ensure_output_dirs(output_plan)
+        dataset_payloads = dataset_payloads
+        if dataset_payloads["status"] != "loaded":
+            raise RuntimeError("Dataset manifest is required for numpy fallback training.")
+        fit_result = fit_numpy_residual_model(config, dataset_payloads)
+        summary["device"] = "numpy-cpu"
+        summary["model"] = {
+            "input_dim": int(config.get("data", {}).get("input_dim", 4)),
+            "hidden_dim": int(config.get("model", {}).get("hidden_dim", 128)),
+            "proj_dim": int(config.get("model", {}).get("proj_dim", 64)),
+            "output_dim": int(config.get("data", {}).get("output_dim", 1)),
+            "num_heads": int(config.get("model", {}).get("num_heads", 4)),
+            "eq_wise_heads": bool(config.get("model", {}).get("eq_wise_heads", True)),
+            "dropout": float(config.get("model", {}).get("dropout", 0.0)),
+            "sequence_length": int(config.get("data", {}).get("sequence_length", 64)),
+            "batch_size": int(config.get("train", {}).get("batch_size", 32)),
+        }
+        summary["training_results"] = fit_result
+        append_metrics_row(
+            output_plan["metrics_csv"],
+            {
+                "run_id": run_name,
+                "stage": stage,
+                "epoch": fit_result.get("epochs", 1),
+                "split": "train",
+                "tag": fit_result["backend"],
+                "rel_l2": fit_result["train_metrics"]["rel_l2"],
+                "pde_residual": fit_result["train_metrics"]["pde_residual"],
+                "bc_violation": fit_result["train_metrics"]["bc_violation"],
+                "conservation_error": fit_result["train_metrics"]["conservation_error"],
+                "total": fit_result["train_metrics"].get("total", ""),
+                "status": "trained",
+            },
+        )
+        append_metrics_row(
+            output_plan["metrics_csv"],
+            {
+                "run_id": run_name,
+                "stage": stage,
+                "epoch": fit_result.get("epochs", 1),
+                "split": "val",
+                "tag": fit_result["backend"],
+                "rel_l2": fit_result["val_metrics"]["rel_l2"],
+                "pde_residual": fit_result["val_metrics"]["pde_residual"],
+                "bc_violation": fit_result["val_metrics"]["bc_violation"],
+                "conservation_error": fit_result["val_metrics"]["conservation_error"],
+                "total": fit_result["val_metrics"].get("total", ""),
+                "status": "evaluated",
+            },
+        )
+        save_summary(output_plan["summary_json"], summary)
+        save_checkpoint(output_plan["checkpoint"], model={"backend": fit_result["backend"]}, metadata=summary)
+        output_plan["log_file"].write_text(
+            json.dumps(summary, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        print(json.dumps(summary, indent=2, sort_keys=True))
+        return
+
     build_loss_breakdown, pcr_model_cls, _ = load_training_components()
     device = choose_device(args.device)
     model_cfg = build_model_config(config)
     model = pcr_model_cls(model_cfg).to(device)
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=float(config.get("train", {}).get("learning_rate", 1e-3)),
-    )
     loss_weights = {
         name: float(value)
         for name, value in (config.get("loss", {}) or {}).items()
     }
-    features, targets = synthetic_batch(model_cfg=model_cfg, device=device)
     summary["device"] = str(device)
     summary["model"] = model_cfg.to_dict()
+    train_cfg = config.get("train", {}) or {}
+    set_global_seed(int(train_cfg.get("seed", 42)))
 
     if args.dry_run:
+        features = torch.tensor(
+            np.asarray(dataset_payloads["train"]["inputs"][:1], dtype=np.float32),
+            device=device,
+        )
+        targets = torch.tensor(
+            np.asarray(dataset_payloads["train"]["residual_targets"][:1], dtype=np.float32),
+            device=device,
+        )
         dry_losses = build_loss_breakdown(
             predictions=model(features),
             targets=targets,
@@ -342,17 +577,48 @@ def main() -> None:
         return
 
     ensure_output_dirs(output_plan)
-    metrics = run_training_step(
+    fit_result, best_state_dict = fit_torch_residual_supervised(
         model=model,
-        optimizer=optimizer,
-        features=features,
-        targets=targets,
-        loss_weights=loss_weights,
+        train_payload=dataset_payloads["train"],
+        val_payload=dataset_payloads["val"],
+        config=config,
+        build_loss_breakdown=build_loss_breakdown,
+        device=str(device),
     )
-    summary["final_metrics"] = metrics
+    if hasattr(model, "load_state_dict"):
+        model.load_state_dict(best_state_dict)
+    summary["training_results"] = fit_result
     append_metrics_row(
         output_plan["metrics_csv"],
-        {"run_name": run_name, "stage": stage, **metrics},
+        {
+            "run_id": run_name,
+            "stage": stage,
+            "epoch": fit_result.get("best_epoch", fit_result.get("epochs", 1)),
+            "split": "train",
+            "tag": fit_result["backend"],
+            "rel_l2": fit_result["train_metrics"]["rel_l2"],
+            "pde_residual": fit_result["train_metrics"]["pde_residual"],
+            "bc_violation": fit_result["train_metrics"]["bc_violation"],
+            "conservation_error": fit_result["train_metrics"]["conservation_error"],
+            "total": fit_result["train_metrics"].get("total", ""),
+            "status": "trained",
+        },
+    )
+    append_metrics_row(
+        output_plan["metrics_csv"],
+        {
+            "run_id": run_name,
+            "stage": stage,
+            "epoch": fit_result.get("best_epoch", fit_result.get("epochs", 1)),
+            "split": "val",
+            "tag": fit_result["backend"],
+            "rel_l2": fit_result["val_metrics"]["rel_l2"],
+            "pde_residual": fit_result["val_metrics"]["pde_residual"],
+            "bc_violation": fit_result["val_metrics"]["bc_violation"],
+            "conservation_error": fit_result["val_metrics"]["conservation_error"],
+            "total": fit_result["val_metrics"].get("total", ""),
+            "status": "evaluated",
+        },
     )
     save_summary(output_plan["summary_json"], summary)
     save_checkpoint(output_plan["checkpoint"], model, metadata=summary)
