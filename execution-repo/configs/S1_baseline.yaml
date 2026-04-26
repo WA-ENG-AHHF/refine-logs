@@ -1,14 +1,23 @@
 stage: S1
 model:
   name: FNO-residual
+  input_dim: 4
+  hidden_dim: 32
+  output_dim: 2
+  depth: 2
 train:
   epochs: 100
   batch_size: 32
   learning_rate: 0.001
+  seed: 42
 loss:
   l2: 0.7
   pde: 0.2
   bc: 0.1
 output:
-  checkpoint: checkpoints/S1_baseline_best.pt
-  metrics_csv: results/S1_metrics.csv
+  root_dir: outputs/S1_baseline
+  run_name:
+  summary_file: reports/run_summary.json
+  checkpoint_file: checkpoints/S1_baseline_placeholder.pt
+  metrics_file: results/S1_metrics.csv
+  resolved_config_file: reports/resolved_config.yaml
