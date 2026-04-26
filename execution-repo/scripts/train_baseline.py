@@ -247,8 +247,18 @@ def fit_numpy_linear_baseline(
     }
     train_pred_seq = train_pred.reshape(train_payload["targets"].shape)
     val_pred_seq = val_pred.reshape(val_payload["targets"].shape)
-    train_metrics = compute_direct_metrics_numpy(train_pred_seq, train_payload["targets"], loss_weights)
-    val_metrics = compute_direct_metrics_numpy(val_pred_seq, val_payload["targets"], loss_weights)
+    train_metrics = compute_direct_metrics_numpy(
+        train_pred_seq,
+        train_payload["targets"],
+        split_payload=train_payload,
+        weights=loss_weights,
+    )
+    val_metrics = compute_direct_metrics_numpy(
+        val_pred_seq,
+        val_payload["targets"],
+        split_payload=val_payload,
+        weights=loss_weights,
+    )
     return {
         "backend": "numpy-linear",
         "epochs": 1,

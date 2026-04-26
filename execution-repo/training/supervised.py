@@ -44,9 +44,67 @@ def weighted_total_from_metrics(metrics: dict[str, float], weights: dict[str, fl
     )
 
 
+def _spatial_derivatives(field: np.ndarray, x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Compute first and second derivatives with centered finite differences."""
+
+    gradient = np.zeros_like(field, dtype=np.float64)
+    laplacian = np.zeros_like(field, dtype=np.float64)
+    dx = np.diff(x, axis=1)
+    center_dx = x[:, 2:] - x[:, :-2]
+    gradient[:, 1:-1] = (field[:, 2:] - field[:, :-2]) / np.maximum(center_dx, 1e-8)
+    laplacian[:, 1:-1] = (
+        field[:, 2:] - 2.0 * field[:, 1:-1] + field[:, :-2]
+    ) / np.maximum(dx[:, 1:] * dx[:, :-1], 1e-8)
+    return gradient, laplacian
+
+
+def _coupled_adr_operator_from_state(
+    state: np.ndarray,
+    split_payload: dict[str, np.ndarray],
+) -> np.ndarray:
+    """Evaluate the coupled ADR spatial operator on a dense sequence state."""
+
+    state = np.asarray(state, dtype=np.float64)
+    inputs = np.asarray(split_payload["inputs"], dtype=np.float64)
+    coefficients = np.asarray(split_payload["coefficients"], dtype=np.float64)
+    x = np.asarray(inputs[:, :, 4], dtype=np.float64)
+    source_u = np.asarray(inputs[:, :, 2], dtype=np.float64)
+    source_v = np.asarray(inputs[:, :, 3], dtype=np.float64)
+
+    u = state[:, :, 0]
+    v = state[:, :, 1]
+    grad_u, lap_u = _spatial_derivatives(u, x)
+    grad_v, lap_v = _spatial_derivatives(v, x)
+
+    coupling = coefficients[:, 0:1]
+    diffusion_u = coefficients[:, 1:2]
+    diffusion_v = coefficients[:, 2:3]
+    advection_u = coefficients[:, 3:4]
+    advection_v = coefficients[:, 4:5]
+    reaction_u = coefficients[:, 5:6]
+    reaction_v = coefficients[:, 6:7]
+
+    operator_u = (
+        diffusion_u * lap_u
+        - advection_u * grad_u
+        + reaction_u * u
+        + coupling * (v - u)
+        + source_u
+    )
+    operator_v = (
+        diffusion_v * lap_v
+        - advection_v * grad_v
+        + reaction_v * v
+        + coupling * (u - v)
+        + source_v
+    )
+    return np.stack([operator_u, operator_v], axis=-1)
+
+
 def compute_direct_metrics_numpy(
     predictions: np.ndarray,
     targets: np.ndarray,
+    split_payload: dict[str, np.ndarray] | None = None,
     weights: dict[str, float] | None = None,
 ) -> dict[str, float]:
     """Compute portable direct-regression metrics on dense sequence tensors."""
@@ -54,9 +112,15 @@ def compute_direct_metrics_numpy(
     predictions = np.asarray(predictions, dtype=np.float64)
     targets = np.asarray(targets, dtype=np.float64)
     residual = predictions - targets
+    if split_payload is not None and "coefficients" in split_payload:
+        pred_operator = _coupled_adr_operator_from_state(predictions, split_payload)
+        target_operator = _coupled_adr_operator_from_state(targets, split_payload)
+        pde_residual = float(np.mean(np.abs(pred_operator - target_operator)))
+    else:
+        pde_residual = float(np.mean(np.abs(residual)))
     metrics = {
         "rel_l2": rel_l2(predictions, targets),
-        "pde_residual": float(np.mean(np.abs(residual))),
+        "pde_residual": pde_residual,
         "bc_violation": float(np.mean(np.abs(residual[:, [0, -1], :]))),
         "conservation_error": float(
             np.mean(np.abs(predictions.sum(axis=1) - targets.sum(axis=1)))
@@ -71,6 +135,7 @@ def compute_residual_metrics_numpy(
     residual_targets: np.ndarray,
     fine_targets: np.ndarray,
     coarse_interp: np.ndarray,
+    split_payload: dict[str, np.ndarray],
     weights: dict[str, float] | None = None,
 ) -> dict[str, float]:
     """Compute coarse-to-fine residual metrics on dense sequence tensors."""
@@ -80,10 +145,11 @@ def compute_residual_metrics_numpy(
     fine_targets = np.asarray(fine_targets, dtype=np.float64)
     coarse_interp = np.asarray(coarse_interp, dtype=np.float64)
     reconstructed = coarse_interp + predicted_residual
-    residual_error = predicted_residual - residual_targets
+    pred_operator = _coupled_adr_operator_from_state(reconstructed, split_payload)
+    target_operator = _coupled_adr_operator_from_state(fine_targets, split_payload)
     metrics = {
         "rel_l2": rel_l2(reconstructed, fine_targets),
-        "pde_residual": float(np.mean(np.abs(residual_error))),
+        "pde_residual": float(np.mean(np.abs(pred_operator - target_operator))),
         "bc_violation": float(
             np.mean(np.abs(reconstructed[:, [0, -1], :] - fine_targets[:, [0, -1], :]))
         ),
@@ -128,6 +194,7 @@ def _evaluate_torch_direct_model(
     targets: Any,
     build_loss_breakdown: Any,
     loss_weights: dict[str, float],
+    split_payload: dict[str, np.ndarray] | None = None,
 ) -> dict[str, float]:
     with torch.no_grad():
         predictions = model(inputs)
@@ -138,7 +205,12 @@ def _evaluate_torch_direct_model(
         )
         predictions_np = predictions.detach().cpu().numpy()
         targets_np = targets.detach().cpu().numpy()
-        metrics = compute_direct_metrics_numpy(predictions_np, targets_np, loss_weights)
+        metrics = compute_direct_metrics_numpy(
+            predictions_np,
+            targets_np,
+            split_payload=split_payload,
+            weights=loss_weights,
+        )
     metrics["torch_l2"] = float(losses["l2"].detach().cpu().item())
     metrics["torch_total"] = float(losses["total"].detach().cpu().item())
     return metrics
@@ -210,6 +282,7 @@ def fit_torch_direct_supervised(
             train_targets,
             build_loss_breakdown,
             loss_weights,
+            split_payload=train_payload,
         )
         val_metrics = _evaluate_torch_direct_model(
             model,
@@ -217,6 +290,7 @@ def fit_torch_direct_supervised(
             val_targets,
             build_loss_breakdown,
             loss_weights,
+            split_payload=val_payload,
         )
 
         if val_metrics["total"] < best_val_total:
@@ -243,6 +317,7 @@ def fit_torch_direct_supervised(
         train_targets,
         build_loss_breakdown,
         loss_weights,
+        split_payload=train_payload,
     )
     best_val_metrics = _evaluate_torch_direct_model(
         model,
@@ -250,6 +325,7 @@ def fit_torch_direct_supervised(
         val_targets,
         build_loss_breakdown,
         loss_weights,
+        split_payload=val_payload,
     )
 
     summary = {
@@ -330,6 +406,7 @@ def fit_torch_residual_supervised(
         residual_targets: Any,
         fine_targets: np.ndarray,
         coarse_interp: np.ndarray,
+        split_payload: dict[str, np.ndarray],
     ) -> dict[str, float]:
         with torch.no_grad():
             predicted_residual = model(inputs)
@@ -345,6 +422,7 @@ def fit_torch_residual_supervised(
                 residual_targets_np,
                 fine_targets,
                 coarse_interp,
+                split_payload,
                 loss_weights,
             )
         metrics["torch_residual_l2"] = float(losses["l2"].detach().cpu().item())
@@ -370,12 +448,14 @@ def fit_torch_residual_supervised(
             train_residual_targets,
             train_fine_targets,
             train_coarse_interp,
+            train_payload,
         )
         val_metrics = evaluate_model(
             val_inputs,
             val_residual_targets,
             val_fine_targets,
             val_coarse_interp,
+            val_payload,
         )
 
         if val_metrics["total"] < best_val_total:
@@ -401,12 +481,14 @@ def fit_torch_residual_supervised(
         train_residual_targets,
         train_fine_targets,
         train_coarse_interp,
+        train_payload,
     )
     best_val_metrics = evaluate_model(
         val_inputs,
         val_residual_targets,
         val_fine_targets,
         val_coarse_interp,
+        val_payload,
     )
 
     summary = {
