@@ -1,0 +1,16 @@
+stage: S0
+dataset:
+  name: Darcy2D-main
+  root_dir: data/darcy2d_v1
+  manifest_path: data/darcy2d_v1/manifest.json
+  required_paths:
+    - data/darcy2d_v1/manifest.json
+checks:
+  validate_shapes: true
+  validate_boundary_encoding: true
+  validate_flux_metric: true
+  validate_repair_stability: true
+  validate_checkpoint_cycle: true
+output:
+  report_json: logs/S0_darcy_sanity_report.json
+

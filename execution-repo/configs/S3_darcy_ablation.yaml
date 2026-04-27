@@ -1,0 +1,12 @@
+stage: S3
+runs:
+  - S3.1_residual_only
+  - S3.2_soft_pde
+  - S3.3_soft_pde_soft_flux
+  - S3.4_boundary_clamp
+  - S3.5_flux_repair
+controls:
+  same_param_baseline: true
+output:
+  metrics_csv: results/S3_darcy_ablation_matrix.csv
+
