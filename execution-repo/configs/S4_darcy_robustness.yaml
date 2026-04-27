@@ -1,0 +1,9 @@
+stage: S4
+eval:
+  ood_contrast: true
+  varying_boundary_conditions: true
+  extreme_contrast_threshold: 1.0e4
+output:
+  ood_csv: results/S4_darcy_ood_analysis.csv
+  bc_csv: results/S4_darcy_bc_analysis.csv
+

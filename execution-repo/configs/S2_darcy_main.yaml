@@ -1,0 +1,28 @@
+stage: S2
+dataset:
+  root_dir: data/darcy2d_v1
+  manifest_path: data/darcy2d_v1/manifest.json
+model:
+  name: Flux-Repaired-ResidualNO
+  hidden_dim: 128
+  proj_dim: 64
+  num_heads: 1
+  eq_wise_heads: false
+  dropout: 0.0
+data:
+  input_dim: 6
+  output_dim: 1
+  sequence_length: 128
+train:
+  epochs: 150
+  batch_size: 16
+  learning_rate: 0.001
+loss:
+  l2: 0.7
+  pde: 0.2
+  bc: 0.1
+  conservation: 0.0
+output:
+  checkpoint: checkpoints/S2_darcy_best.pt
+  metrics_csv: results/S2_darcy_metric_comparison.csv
+

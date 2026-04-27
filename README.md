@@ -1,15 +1,16 @@
 # refine-logs
 
-Research control tower and execution scaffold for the PCR-NO project:
-Physics-Consistent Residual Neural Operator for coupled PDE coarse-to-fine correction.
+Research control tower and execution scaffold for two closely related threads:
+- a legacy toy scaffold for coupled 1D ADR coarse-to-fine correction
+- the current main direction: high-contrast 2D Darcy pressure super-resolution with flux-repaired residual reconstruction
 
 ## Project status
 
-- Research direction: frozen
-- Experiment roadmap: defined
+- Research direction: re-anchored around 2D Darcy
+- Legacy toy path: retained for sanity checks only
+- Experiment roadmap: defined for both legacy and Darcy tracks
 - Multi-agent workflow: scaffolded
-- Execution code: initialized
-- GitHub repo: connected and live
+- Execution code: initialized and being specialized
 
 ## Repository goals
 
@@ -26,21 +27,23 @@ This structure is designed for supervised multi-agent delivery, where planning, 
 
 Read these files in order:
 
-1. `FINAL_PROPOSAL.md`
-2. `EXPERIMENT_PLAN.md`
-3. `EXPERIMENT_TRACKER_DETAILED_20260425_141645.md`
+1. `FINAL_PROPOSAL_DARCY.md`
+2. `EXPERIMENT_PLAN_DARCY.md`
+3. `EXPERIMENT_TRACKER_DARCY.md`
 4. `MULTI_AGENT_EXECUTION_BLUEPRINT.md`
 5. `agent-prompts/README.md`
 6. `execution-repo/README.md`
+
+Legacy proposal files remain in the repo for historical reference, but they no longer define the main paper direction.
 
 ## Repository map
 
 ### Research control
 - `MULTI_AGENT_EXECUTION_BLUEPRINT.md`
-- `FINAL_PROPOSAL.md`
-- `EXPERIMENT_PLAN.md`
-- `EXPERIMENT_TRACKER*.md`
-- `PIPELINE_SUMMARY*.md`
+- `FINAL_PROPOSAL_DARCY.md`
+- `EXPERIMENT_PLAN_DARCY.md`
+- `EXPERIMENT_TRACKER_DARCY.md`
+- legacy proposal and tracker files for the coupled-ADR scaffold
 
 ### Coordination
 - `coordination/MASTER_BOARD.md`
@@ -90,14 +93,15 @@ python scripts/train_pcr_no.py
 
 ## Current next milestone
 
-Build the first real execution wave:
-- finalize dataset contract
-- implement S0 sanity checks
-- reproduce S1 baseline
-- freeze the first valid S2 checkpoint
+Specialize the scaffold to the Darcy main line:
+- finalize the 2D Darcy dataset contract
+- implement Darcy-specific S0 sanity checks
+- reproduce direct and residual Darcy baselines
+- freeze the first valid flux-repaired residual checkpoint
 
 ## Notes
 
-- This repository is intentionally stage-driven rather than framework-heavy.
-- The current execution code is scaffold-level and ready for multi-agent implementation.
+- The repository is intentionally stage-driven rather than framework-heavy.
+- The old 1D coupled ADR assets are kept as a toy benchmark and debugging path.
+- The new main line should prefer Darcy-specific configs and scripts when both exist.
 - Large binary outputs should stay out of Git and be tracked through reports and registries.

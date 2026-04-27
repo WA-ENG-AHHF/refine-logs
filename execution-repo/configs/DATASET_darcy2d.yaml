@@ -1,0 +1,24 @@
+dataset:
+  name: darcy2d-high-contrast
+  version: 2026-04-27
+  output_dir: data/darcy2d_v1
+  train_samples: 512
+  val_samples: 128
+  test_samples: 128
+  seed: 42
+grid:
+  coarse_size: 32
+  fine_size: 128
+physics:
+  coefficient_mode: lognormal_grf
+  log_k_min: -4.0
+  log_k_max: 4.0
+  source_mode: constant_plus_perturbation
+  source_value: 1.0
+boundary:
+  type: dirichlet
+  profile_mode: random_affine
+splits:
+  contrast_train_max: 1.0e3
+  contrast_test_max: 1.0e4
+

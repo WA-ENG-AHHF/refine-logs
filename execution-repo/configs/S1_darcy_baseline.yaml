@@ -1,0 +1,27 @@
+stage: S1
+dataset:
+  root_dir: data/darcy2d_v1
+  manifest_path: data/darcy2d_v1/manifest.json
+model:
+  name: Darcy-DirectNO
+  input_dim: 6
+  hidden_dim: 64
+  output_dim: 1
+  depth: 3
+train:
+  epochs: 120
+  batch_size: 16
+  learning_rate: 0.001
+  seed: 42
+loss:
+  l2: 1.0
+  pde: 0.0
+  bc: 0.0
+output:
+  root_dir: outputs/S1_darcy_baseline
+  run_name:
+  summary_file: reports/run_summary.json
+  checkpoint_file: checkpoints/S1_darcy_baseline.pt
+  metrics_file: results/S1_darcy_metrics.csv
+  resolved_config_file: reports/resolved_config.yaml
+
